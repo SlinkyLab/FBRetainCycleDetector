@@ -20,6 +20,7 @@
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
+#include <pthread.h>
 
 #ifdef __LP64__
 typedef struct mach_header_64 mach_header_t;
@@ -39,6 +40,10 @@ typedef struct nlist nlist_t;
 #define SEG_DATA_CONST  "__DATA_CONST"
 #endif
 
+#ifndef SEG_AUTH_CONST
+#define SEG_AUTH_CONST  "__AUTH_CONST"
+#endif
+
 struct rcd_rebindings_entry {
   struct rcd_rebinding *rebindings;
   size_t rebindings_nel;
@@ -46,6 +51,7 @@ struct rcd_rebindings_entry {
 };
 
 static struct rcd_rebindings_entry *_rebindings_head;
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int rcd_prepend_rebindings(struct rcd_rebindings_entry **rebindings_head,
                               struct rcd_rebinding rebindings[],
@@ -94,17 +100,23 @@ static void rcd_perform_rebinding_with_section(struct rcd_rebindings_entry *rebi
                                            char *strtab,
                                            uint32_t *indirect_symtab) {
   const bool isDataConst = strcmp(section->segname, "__DATA_CONST") == 0;
+  const bool isAuthConst = strcmp(section->segname, SEG_AUTH_CONST) == 0;
   uint32_t *indirect_symbol_indices = indirect_symtab + section->reserved1;
   void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);
   vm_prot_t oldProtection = VM_PROT_READ;
-  if (isDataConst) {
-    oldProtection = get_protection(rebindings);
-    mprotect(indirect_symbol_bindings, section->size, PROT_READ | PROT_WRITE);
+  vm_size_t trunc_address = (vm_size_t)indirect_symbol_bindings;
+  vm_size_t trunc_size = 0;
+  if (isDataConst || isAuthConst) {
+    trunc_address = trunc_page((vm_size_t)indirect_symbol_bindings);
+    trunc_size =(vm_size_t)indirect_symbol_bindings -trunc_address;
+    pthread_mutex_lock(&mutex);
+    oldProtection = get_protection((void *)trunc_address);
+    mprotect((void *)trunc_address, section->size+trunc_size, PROT_READ | PROT_WRITE);
   }
   for (uint i = 0; i < section->size / sizeof(void *); i++) {
     uint32_t symtab_index = indirect_symbol_indices[i];
     if (symtab_index == INDIRECT_SYMBOL_ABS || symtab_index == INDIRECT_SYMBOL_LOCAL ||
-        symtab_index == (INDIRECT_SYMBOL_LOCAL   | INDIRECT_SYMBOL_ABS)) {
+        symtab_index == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) {
       continue;
     }
     uint32_t strtab_offset = symtab[symtab_index].n_un.n_strx;
@@ -127,7 +139,7 @@ static void rcd_perform_rebinding_with_section(struct rcd_rebindings_entry *rebi
     }
   symbol_loop:;
   }
-  if (isDataConst) {
+  if (isDataConst || isAuthConst) {
     int protection = 0;
     if (oldProtection & VM_PROT_READ) {
       protection |= PROT_READ;
@@ -138,7 +150,8 @@ static void rcd_perform_rebinding_with_section(struct rcd_rebindings_entry *rebi
     if (oldProtection & VM_PROT_EXECUTE) {
       protection |= PROT_EXEC;
     }
-    mprotect(indirect_symbol_bindings, section->size, protection);
+    mprotect((void *)trunc_address, section->size+trunc_size, protection);
+    pthread_mutex_unlock(&mutex);
   }
 }
 
@@ -187,7 +200,8 @@ static void rebind_symbols_for_image(struct rcd_rebindings_entry *rebindings,
     cur_seg_cmd = (segment_command_t *)cur;
     if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
       if (strcmp(cur_seg_cmd->segname, SEG_DATA) != 0 &&
-          strcmp(cur_seg_cmd->segname, SEG_DATA_CONST) != 0) {
+          strcmp(cur_seg_cmd->segname, SEG_DATA_CONST) != 0 &&
+          strcmp(cur_seg_cmd->segname, SEG_AUTH_CONST) != 0) {
         continue;
       }
       for (uint j = 0; j < cur_seg_cmd->nsects; j++) {
